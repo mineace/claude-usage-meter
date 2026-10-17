@@ -1,0 +1,1 @@
+{ "name": "usage-pacer", "version": "0.1.0", "description": "Lets Claude read your plan usage (5h / 7-day limits), context fill and session cost so it can pace its work." }

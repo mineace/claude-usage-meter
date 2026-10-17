@@ -1,0 +1,6 @@
+{
+  "name": "usage-pacer",
+  "description": "Lets Claude see your plan usage and wind down before the limit.",
+  "owner": { "name": "mineace" },
+  "plugins": [{ "name": "usage-pacer", "source": "./" }]
+}
