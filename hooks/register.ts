@@ -1,37 +1,79 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-import { advice, brief, describeLevel, handoffNotice, handoffPrompt, label, parseLevel, report, windDown } from './usage'
+import {
+  COMPACT_INSTRUCTIONS,
+  advice,
+  brief,
+  critical,
+  describeLimits,
+  handoffNotice,
+  handoffPrompt,
+  handoffRequest,
+  isOff,
+  label,
+  parseLimits,
+  reached,
+  report,
+  windDown,
+  wrapUpNotice,
+} from './usage'
+import type { Limits } from './usage'
 
 const TOOL = 'mcp__usage-pacer__get_usage'
 const THRESHOLDS = [75, 90]
 
-type Stored = { text: string; level?: number }
+type Stored = { text: string; limits?: Limits; compactFirst?: boolean }
 
-// Stores the level as the /config row would, so it holds in later sessions, on any surface.
-async function storeLevel($: EngineInterface, raw: string): Promise<Stored> {
-  const level = parseLevel(raw)
-  if (level === undefined) return { text: `"${raw}" is not a level: use a whole number from 1 to 99, or off.` }
-  const { deny } = await $.config.set({ key: 'usage-pacer.handoffAt', value: level })
-  if (deny) return { text: `Could not change the handoff level: ${deny}` }
-  return { text: describeLevel(level), level }
+// Stores the levels as the /config rows would, so they hold in later sessions, on any surface.
+async function storeLimits(
+  $: EngineInterface,
+  next: Partial<Limits>,
+  compactFirst: boolean | undefined,
+  current: Limits,
+  currentCompact: boolean,
+): Promise<Stored> {
+  const limits = { ...current, ...next }
+  const rows: [string, number | boolean][] = []
+  if (next.percent !== undefined) rows.push(['usage-pacer.handoffAt', next.percent])
+  if (next.tokens !== undefined) rows.push(['usage-pacer.handoffTokens', next.tokens])
+  if (compactFirst !== undefined) rows.push(['usage-pacer.compactFirst', compactFirst])
+  for (const [key, value] of rows) {
+    const { deny } = await $.config.set({ key, value })
+    if (deny) return { text: `Could not change ${key}: ${deny}` }
+  }
+  const compact = compactFirst ?? currentCompact
+  return { text: describeLimits(limits, compact), limits, compactFirst: compact }
 }
 
 export const register: Register = (on, options) => {
-  let handoffAt = Number(options.handoffAt ?? 75)
-  // Whether Claude was already asked to hand off in this context window.
-  let askedHandoff = false
+  let limits: Limits = {
+    percent: Number(options.handoffAt ?? 65),
+    tokens: Number(options.handoffTokens ?? 300_000),
+  }
+  let compactFirst = options.compactFirst !== false
+  // Where this context window stands: compacted once already, and what Claude has been told.
+  let compacted = false
+  let toldWrapUp = false
+  let toldHandoff = false
+  let requestedHandoff = false
   let cwd = '.'
   // Highest threshold already announced per window, so each one toasts once.
   const announced = new Map<string, number>()
   // Highest wind-down level already sent to Claude per window (kind + reset time).
   const warned = new Map<string, number>()
 
-  // Keeps this load in step with a level just stored.
+  const freshContext = () => {
+    compacted = false
+    toldWrapUp = false
+    toldHandoff = false
+    requestedHandoff = false
+  }
+
   const applied = (r: Stored) => {
-    if (r.level !== undefined) {
-      handoffAt = r.level
-      askedHandoff = false
-    }
+    if (r.limits) limits = r.limits
+    if (r.compactFirst !== undefined) compactFirst = r.compactFirst
+    toldWrapUp = false
+    toldHandoff = false
     return r.text
   }
 
@@ -50,18 +92,22 @@ export const register: Register = (on, options) => {
     })
     await $.command.register({
       name: 'handoff-at',
-      description: 'Show or set the context % at which Claude hands off to a fresh agent (off to disable)',
-      argumentHint: '[percent | off]',
+      description: 'Show or set when Claude hands off to a fresh agent: 40%, 300k, both, or off',
+      argumentHint: '[40% | 300k | 40% 300k | off]',
     })
     await $.tool.register({
       name: 'set_handoff_level',
       description:
-        'Sets the context-window percentage at which usage-pacer asks you to hand off to a fresh agent ' +
-        '(0 turns handoff off). Call it only when the user asks to change or turn off the handoff level.',
+        'Sets when usage-pacer hands the task to a fresh agent: a context percentage, a token count, or both ' +
+        '(whichever is reached first; 0 turns that one off), and whether it compacts once first. ' +
+        'Call it only when the user asks to change the handoff settings.',
       inputSchema: {
         type: 'object',
-        properties: { percent: { type: 'integer', minimum: 0, maximum: 99 } },
-        required: ['percent'],
+        properties: {
+          percent: { type: 'integer', minimum: 0, maximum: 99 },
+          tokens: { type: 'integer', minimum: 0 },
+          compactFirst: { type: 'boolean' },
+        },
       },
       isDeferred: false,
     })
@@ -89,16 +135,24 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: /^mcp__usage-pacer__get_usage$/ }, async $ => ({
-    result: report(await $.session.usage(), await $.clock.now()),
+    result: `${report(await $.session.usage(), await $.clock.now())}\n${describeLimits(limits, compactFirst)}`,
   })).catch(() => ({ result: 'Usage figures are unavailable right now.' }))
 
-  on('command.run', { command: 'handoff-at' }, async ($, e) => ({
-    text: (e.args ?? '').trim() ? applied(await storeLevel($, e.args)) : `${describeLevel(handoffAt)} Change it with /handoff-at <percent | off>.`,
-  }))
+  on('command.run', { command: 'handoff-at' }, async ($, e) => {
+    const args = (e.args ?? '').trim()
+    if (!args) return { text: `${describeLimits(limits, compactFirst)} Change it with /handoff-at 40%, 300k, 40% 300k or off.` }
+    const parsed = parseLimits(args)
+    if (!parsed) return { text: `"${args}" is not a level: use 40% (1-99), 300k or 1.2m (10k or more), both, or off.` }
+    return { text: applied(await storeLimits($, parsed, undefined, limits, compactFirst)) }
+  })
 
-  on('tool.call', { tool: /^mcp__usage-pacer__set_handoff_level$/ }, async ($, e) => ({
-    result: applied(await storeLevel($, String((e as { percent?: unknown }).percent ?? ''))),
-  })).catch(() => ({ result: 'Could not change the handoff level.' }))
+  on('tool.call', { tool: /^mcp__usage-pacer__set_handoff_level$/ }, async ($, e) => {
+    const { percent, tokens, compactFirst: compact } = e as { percent?: number; tokens?: number; compactFirst?: boolean }
+    const next: Partial<Limits> = {}
+    if (percent !== undefined) next.percent = percent
+    if (tokens !== undefined) next.tokens = tokens
+    return { result: applied(await storeLimits($, next, compact, limits, compactFirst)) }
+  }).catch(() => ({ result: 'Could not change the handoff settings.' }))
 
   on('tool.call', { tool: /^mcp__usage-pacer__handoff$/ }, async ($, e) => {
     const summary = String((e as { summary?: unknown }).summary ?? '').trim()
@@ -109,7 +163,7 @@ export const register: Register = (on, options) => {
     // Clearing has to wait for this turn to end; the command and the prompt queue until idle.
     $.clock.after(0, async () => {
       await $.command.run({ command: 'clear' })
-      askedHandoff = false
+      freshContext()
       await $.prompt.submit({ text: handoffPrompt(path, summary) })
     })
     $.ui.toast('Handing off to a fresh agent')
@@ -120,8 +174,7 @@ export const register: Register = (on, options) => {
     }
   }).catch(() => ({ result: 'Handoff failed; keep working and tell the user.' }))
 
-  // Mid-turn wind-down: a long turn sees no new prompt, so the notice rides on the
-  // next tool result once a limit window crosses a wind-down level.
+  // Mid-turn notices ride on the next tool result: a long turn sees no new prompt.
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
     if (ran.deny !== undefined) return ran
@@ -132,24 +185,70 @@ export const register: Register = (on, options) => {
       notices.push(notice)
       $.ui.toast('Usage nearly exhausted: asked Claude to wind down')
     }
-    const percent = u.context.percent ?? 0
-    if (percent < handoffAt) askedHandoff = false
-    else if (handoffAt > 0 && !askedHandoff) {
-      askedHandoff = true
-      notices.push(handoffNotice(percent))
-      $.ui.toast(`Context ${percent}% full: asked Claude to hand off`)
+    if (!isOff(limits) && reached(u.context, limits)) {
+      if (critical(u.context, limits) && !toldHandoff) {
+        // Too full to wait for the turn to end.
+        toldHandoff = true
+        toldWrapUp = true
+        notices.push(handoffNotice(u.context))
+        $.ui.toast('Context nearly full: asked Claude to hand off now')
+      } else if (!toldWrapUp) {
+        // Never interrupt: steer toward a stopping point and act when the turn ends.
+        toldWrapUp = true
+        notices.push(wrapUpNotice(u.context, compactFirst && !compacted))
+      }
     }
     if (!notices.length) return ran
     return { ...ran, context: [...(ran.context ?? []), ...notices] }
   }).catch(($, e, next) => next(e))
+
+  // Between turns: compact once to let the task carry on, then hand off the next time.
+  on('turn.complete', async ($, e, next) => {
+    const done = await next(e)
+    if (e.agentId || e.reason !== 'answer' || isOff(limits) || requestedHandoff) return done
+    const u = await $.session.usage()
+    if (!reached(u.context, limits)) return done
+    if (compactFirst && !compacted) {
+      compacted = true
+      $.ui.toast(`Context at ${u.context.percent ?? 0}%: compacting before a handoff is needed`)
+      $.clock.after(0, async () => {
+        await $.session.compact({ instructions: COMPACT_INSTRUCTIONS })
+        toldWrapUp = false
+        toldHandoff = false
+      })
+    } else {
+      requestedHandoff = true
+      $.ui.toast(`Context at ${u.context.percent ?? 0}%: asking Claude to hand off`)
+      $.clock.after(0, () => void $.prompt.submit({ text: handoffRequest(u.context) }))
+    }
+    return done
+  }).catch(($, e, next) => next(e))
+
+  // A compaction from anywhere (auto, /compact) counts as the one before the handoff.
+  on('session.compact', async ($, e, next) => {
+    const r = await next(e)
+    if (!e.agentId && e.trigger !== 'precompute' && !('skip' in r && r.skip)) {
+      compacted = true
+      toldWrapUp = false
+      toldHandoff = false
+    }
+    return r
+  })
+
+  on('session.end', ($, e, next) => {
+    if (e.reason === 'clear') freshContext()
+    return next(e)
+  })
 
   // A one-line usage note rides along with every prompt, so planning starts informed.
   on('prompt.submit', async ($, e, next) => {
     const u = await $.session.usage()
     const line = brief(u)
     if (!line) return next(e)
-    const percent = u.context.percent ?? 0
-    const a = handoffAt > 0 && percent >= handoffAt ? handoffNotice(percent).replace('[usage-pacer] ', '') : advice(u)
+    const past = !isOff(limits) && reached(u.context, limits)
+    const a = past
+      ? 'Context is past the handoff level: keep this turn focused and avoid large new work; usage-pacer acts when the turn ends.'
+      : advice(u)
     const note = `[usage-pacer] Current usage: ${line}.${a ? ` ${a}` : ''} Call ${TOOL} for reset times and detail.`
     return next({ ...e, context: [...(e.context ?? []), note] })
   }).catch(($, e, next) => next(e))
