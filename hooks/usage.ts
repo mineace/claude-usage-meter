@@ -96,3 +96,14 @@ export const handoffPrompt = (path: string, summary: string) =>
   `You are continuing work handed off by a previous agent whose context window filled up. ` +
   `Its handoff (also saved at ${path}):\n\n${summary}\n\n` +
   'Check the current state of the files before acting on it, then carry on with what remains.'
+
+/** Reads a handoff level as typed: `60`, `60%`, `off` or `0`; undefined when it is neither. */
+export const parseLevel = (raw: string) => {
+  const text = raw.trim().toLowerCase().replace(/%$/, '')
+  if (text === 'off') return 0
+  const n = Number(text)
+  return text !== '' && Number.isInteger(n) && n >= 0 && n <= 99 ? n : undefined
+}
+
+export const describeLevel = (level: number) =>
+  level > 0 ? `Handoff is set to ${level}% context.` : 'Handoff is off.'

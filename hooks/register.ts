@@ -1,12 +1,23 @@
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
-import { advice, brief, handoffNotice, handoffPrompt, label, report, windDown } from './usage'
+import { advice, brief, describeLevel, handoffNotice, handoffPrompt, label, parseLevel, report, windDown } from './usage'
 
 const TOOL = 'mcp__usage-pacer__get_usage'
 const THRESHOLDS = [75, 90]
 
+type Stored = { text: string; level?: number }
+
+// Stores the level as the /config row would, so it holds in later sessions, on any surface.
+async function storeLevel($: EngineInterface, raw: string): Promise<Stored> {
+  const level = parseLevel(raw)
+  if (level === undefined) return { text: `"${raw}" is not a level: use a whole number from 1 to 99, or off.` }
+  const { deny } = await $.config.set({ key: 'usage-pacer.handoffAt', value: level })
+  if (deny) return { text: `Could not change the handoff level: ${deny}` }
+  return { text: describeLevel(level), level }
+}
+
 export const register: Register = (on, options) => {
-  const handoffAt = Number(options.handoffAt ?? 75)
+  let handoffAt = Number(options.handoffAt ?? 75)
   // Whether Claude was already asked to hand off in this context window.
   let askedHandoff = false
   let cwd = '.'
@@ -14,6 +25,15 @@ export const register: Register = (on, options) => {
   const announced = new Map<string, number>()
   // Highest wind-down level already sent to Claude per window (kind + reset time).
   const warned = new Map<string, number>()
+
+  // Keeps this load in step with a level just stored.
+  const applied = (r: Stored) => {
+    if (r.level !== undefined) {
+      handoffAt = r.level
+      askedHandoff = false
+    }
+    return r.text
+  }
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -28,27 +48,42 @@ export const register: Register = (on, options) => {
       inputSchema: { type: 'object', properties: {} },
       isDeferred: false,
     })
-    if (handoffAt > 0) {
-      await $.tool.register({
-        name: 'handoff',
-        description:
-          'Hands the current task to a fresh agent in this same environment when the context window is ' +
-          'nearly full: saves your handoff to a file, clears the conversation once your turn ends, and starts ' +
-          'the fresh agent with the handoff as its first prompt. Call it only when a usage-pacer notice asks ' +
-          'you to, or the user does. The summary is all the fresh agent will know.',
-        inputSchema: {
-          type: 'object',
-          properties: {
-            summary: {
-              type: 'string',
-              description: 'Goal, what is done, what remains (in order), key files and commands, decisions and why, problems hit.',
-            },
+    await $.command.register({
+      name: 'handoff-at',
+      description: 'Show or set the context % at which Claude hands off to a fresh agent (off to disable)',
+      argumentHint: '[percent | off]',
+    })
+    await $.tool.register({
+      name: 'set_handoff_level',
+      description:
+        'Sets the context-window percentage at which usage-pacer asks you to hand off to a fresh agent ' +
+        '(0 turns handoff off). Call it only when the user asks to change or turn off the handoff level.',
+      inputSchema: {
+        type: 'object',
+        properties: { percent: { type: 'integer', minimum: 0, maximum: 99 } },
+        required: ['percent'],
+      },
+      isDeferred: false,
+    })
+    await $.tool.register({
+      name: 'handoff',
+      description:
+        'Hands the current task to a fresh agent in this same environment when the context window is ' +
+        'nearly full: saves your handoff to a file, clears the conversation once your turn ends, and starts ' +
+        'the fresh agent with the handoff as its first prompt. Call it only when a usage-pacer notice asks ' +
+        'you to, or the user does. The summary is all the fresh agent will know.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          summary: {
+            type: 'string',
+            description: 'Goal, what is done, what remains (in order), key files and commands, decisions and why, problems hit.',
           },
-          required: ['summary'],
         },
-        isDeferred: false,
-      })
-    }
+        required: ['summary'],
+      },
+      isDeferred: false,
+    })
     $.ui.status(brief(await $.session.usage()) || undefined)
     return started
   })
@@ -56,6 +91,14 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: /^mcp__usage-pacer__get_usage$/ }, async $ => ({
     result: report(await $.session.usage(), await $.clock.now()),
   })).catch(() => ({ result: 'Usage figures are unavailable right now.' }))
+
+  on('command.run', { command: 'handoff-at' }, async ($, e) => ({
+    text: (e.args ?? '').trim() ? applied(await storeLevel($, e.args)) : `${describeLevel(handoffAt)} Change it with /handoff-at <percent | off>.`,
+  }))
+
+  on('tool.call', { tool: /^mcp__usage-pacer__set_handoff_level$/ }, async ($, e) => ({
+    result: applied(await storeLevel($, String((e as { percent?: unknown }).percent ?? ''))),
+  })).catch(() => ({ result: 'Could not change the handoff level.' }))
 
   on('tool.call', { tool: /^mcp__usage-pacer__handoff$/ }, async ($, e) => {
     const summary = String((e as { summary?: unknown }).summary ?? '').trim()

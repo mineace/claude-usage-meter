@@ -101,3 +101,28 @@ test('the handoff tool saves the note, clears, and starts the fresh agent', asyn
   expect(steps[0]).toBe('/clear')
   expect(steps[1]).toContain('Goal: ship v2. Remaining: tests.')
 })
+
+test('/handoff-at stores the level and the new level takes effect', async ($, on) => {
+  const sets: unknown[] = []
+  on('config.set', (_$, e) => {
+    sets.push(e)
+    return { value: (e as { value: unknown }).value } as never
+  })
+  atContext(on, 65)
+  on('tool.call', () => ({ result: 'ok' }) as never)
+  const shown = await $.command.run({ command: 'handoff-at' } as never)
+  expect(shown.text ?? '').toContain('75%')
+  const set = await $.command.run({ command: 'handoff-at', args: '60%' } as never)
+  expect(set.text).toBe('Handoff is set to 60% context.')
+  expect(sets).toEqual([expect.objectContaining({ key: 'usage-pacer.handoffAt', value: 60 })])
+  const r = await $.tool.call({ tool: 'Read', file_path: 'a.md' } as never)
+  expect(JSON.stringify(r)).toContain('Hand off now')
+})
+
+test('set_handoff_level turns handoff off, and bad input is refused', async ($, on) => {
+  on('config.set', (_$, e) => ({ value: (e as { value: unknown }).value }) as never)
+  const off = await $.tool.call({ tool: 'mcp__usage-pacer__set_handoff_level', percent: 0 } as never)
+  expect(JSON.stringify(off)).toContain('Handoff is off.')
+  const bad = await $.command.run({ command: 'handoff-at', args: '150' } as never)
+  expect(bad.text ?? '').toContain('is not a level')
+})
