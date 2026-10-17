@@ -209,3 +209,60 @@ test('set_handoff_level changes tokens and compactFirst from chat', async ($, on
   expect(JSON.stringify(r)).toContain('65% context or 250k tokens')
   expect(JSON.stringify(r)).toContain('hands off')
 })
+
+test('a compaction that fails or is vetoed is not counted: no handoff yet', async ($, on) => {
+  const clock = mock.clock(on)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  atContext(on, 70)
+  let calls = 0
+  const prompts: string[] = []
+  on('turn.complete', () => ({ text: '' }) as never)
+  on('session.compact', () => {
+    calls++
+    if (calls <= 3) throw new Error('a turn is running')
+    return { skip: 'vetoed' } as never
+  })
+  on('prompt.submit', (_$, e) => (prompts.push(e.text), { text: e.text }) as never)
+  await $.turn.complete(answered)
+  // A turn end while retrying does not start a second attempt.
+  await $.turn.complete(answered)
+  await clock.advance(10_000)
+  expect(calls).toBe(3)
+  expect(prompts).toHaveLength(0)
+  // Out of tries: the next turn end tries again (vetoed this time), still no handoff.
+  await $.turn.complete(answered)
+  await clock.advance(10)
+  expect(calls).toBe(4)
+  expect(prompts).toHaveLength(0)
+})
+
+test('a compaction that stands after a retry counts as the one before the handoff', async ($, on) => {
+  const clock = mock.clock(on)
+  on('ui.toast', () => ({ value: undefined }) as never)
+  atContext(on, 70)
+  let calls = 0
+  const prompts: string[] = []
+  on('turn.complete', () => ({ text: '' }) as never)
+  on('session.compact', () => {
+    if (++calls === 1) throw new Error('a turn is running')
+    return { messages: [SUMMARY] } as never
+  })
+  on('prompt.submit', (_$, e) => (prompts.push(e.text), { text: e.text }) as never)
+  await $.turn.complete(answered)
+  await clock.advance(5_000)
+  expect(calls).toBe(2)
+  await $.turn.complete(answered)
+  await clock.advance(10)
+  expect(prompts.join()).toContain('Write the handoff now')
+})
+
+test("a subagent's tool results get no wrap-up or handoff notice", async ($, on) => {
+  on('ui.toast', () => ({ value: undefined }) as never)
+  atContext(on, 92)
+  on('tool.call', () => ({ result: 'ok' }) as never)
+  const sub = JSON.stringify(await $.tool.call({ tool: 'Read', file_path: 'a.md', agentId: 'a1' } as never))
+  expect(sub).not.toContain('Hand off now')
+  expect(sub).not.toContain('Do not stop mid-task')
+  // The main conversation still hears it.
+  expect(await read($)).toContain('Hand off now')
+})

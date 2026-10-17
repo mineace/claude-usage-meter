@@ -21,6 +21,8 @@ import type { Limits } from './usage'
 
 const TOOL = 'mcp__usage-pacer__get_usage'
 const THRESHOLDS = [75, 90]
+const COMPACT_TRIES = 3
+const COMPACT_RETRY_MS = 2000
 
 type Stored = { text: string; limits?: Limits; compactFirst?: boolean }
 
@@ -45,35 +47,46 @@ async function storeLimits(
   return { text: describeLimits(limits, compact), limits, compactFirst: compact }
 }
 
+// Where this context window stands: compacted once already, and what Claude has been told.
+type Window = { compacted: boolean; compacting: boolean; toldWrapUp: boolean; toldHandoff: boolean; requestedHandoff: boolean }
+const FRESH: Window = { compacted: false, compacting: false, toldWrapUp: false, toldHandoff: false, requestedHandoff: false }
+
+// Compacting rejects while a turn still runs, so a few tries spaced out; it counts only once it stands.
+async function compactOnce($: EngineInterface, w: Window, tries = COMPACT_TRIES): Promise<void> {
+  try {
+    const r = await $.session.compact({ instructions: COMPACT_INSTRUCTIONS })
+    w.compacting = false
+    if (r.skip) return
+    w.compacted = true
+    w.toldWrapUp = false
+    w.toldHandoff = false
+  } catch {
+    if (tries > 1) $.clock.after(COMPACT_RETRY_MS, () => compactOnce($, w, tries - 1))
+    // Out of tries: the next turn end tries again rather than handing off.
+    else w.compacting = false
+  }
+}
+
 export const register: Register = (on, options) => {
   let limits: Limits = {
     percent: Number(options.handoffAt ?? 65),
     tokens: Number(options.handoffTokens ?? 300_000),
   }
   let compactFirst = options.compactFirst !== false
-  // Where this context window stands: compacted once already, and what Claude has been told.
-  let compacted = false
-  let toldWrapUp = false
-  let toldHandoff = false
-  let requestedHandoff = false
+  const w: Window = { ...FRESH }
   let cwd = '.'
   // Highest threshold already announced per window, so each one toasts once.
   const announced = new Map<string, number>()
   // Highest wind-down level already sent to Claude per window (kind + reset time).
   const warned = new Map<string, number>()
 
-  const freshContext = () => {
-    compacted = false
-    toldWrapUp = false
-    toldHandoff = false
-    requestedHandoff = false
-  }
+  const freshContext = () => Object.assign(w, FRESH)
 
   const applied = (r: Stored) => {
     if (r.limits) limits = r.limits
     if (r.compactFirst !== undefined) compactFirst = r.compactFirst
-    toldWrapUp = false
-    toldHandoff = false
+    w.toldWrapUp = false
+    w.toldHandoff = false
     return r.text
   }
 
@@ -185,17 +198,18 @@ export const register: Register = (on, options) => {
       notices.push(notice)
       $.ui.toast('Usage nearly exhausted: asked Claude to wind down')
     }
-    if (!isOff(limits) && reached(u.context, limits)) {
-      if (critical(u.context, limits) && !toldHandoff) {
+    // A subagent's results are not the main conversation's: its window is its own.
+    if (!e.agentId && !isOff(limits) && reached(u.context, limits)) {
+      if (critical(u.context, limits) && !w.toldHandoff) {
         // Too full to wait for the turn to end.
-        toldHandoff = true
-        toldWrapUp = true
+        w.toldHandoff = true
+        w.toldWrapUp = true
         notices.push(handoffNotice(u.context))
         $.ui.toast('Context nearly full: asked Claude to hand off now')
-      } else if (!toldWrapUp) {
+      } else if (!w.toldWrapUp) {
         // Never interrupt: steer toward a stopping point and act when the turn ends.
-        toldWrapUp = true
-        notices.push(wrapUpNotice(u.context, compactFirst && !compacted))
+        w.toldWrapUp = true
+        notices.push(wrapUpNotice(u.context, compactFirst && !w.compacted))
       }
     }
     if (!notices.length) return ran
@@ -205,19 +219,15 @@ export const register: Register = (on, options) => {
   // Between turns: compact once to let the task carry on, then hand off the next time.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (e.agentId || e.reason !== 'answer' || isOff(limits) || requestedHandoff) return done
+    if (e.agentId || e.reason !== 'answer' || isOff(limits) || w.requestedHandoff || w.compacting) return done
     const u = await $.session.usage()
     if (!reached(u.context, limits)) return done
-    if (compactFirst && !compacted) {
-      compacted = true
+    if (compactFirst && !w.compacted) {
+      w.compacting = true
       $.ui.toast(`Context at ${u.context.percent ?? 0}%: compacting before a handoff is needed`)
-      $.clock.after(0, async () => {
-        await $.session.compact({ instructions: COMPACT_INSTRUCTIONS })
-        toldWrapUp = false
-        toldHandoff = false
-      })
+      $.clock.after(0, () => compactOnce($, w))
     } else {
-      requestedHandoff = true
+      w.requestedHandoff = true
       $.ui.toast(`Context at ${u.context.percent ?? 0}%: asking Claude to hand off`)
       $.clock.after(0, () => void $.prompt.submit({ text: handoffRequest(u.context) }))
     }
@@ -228,9 +238,9 @@ export const register: Register = (on, options) => {
   on('session.compact', async ($, e, next) => {
     const r = await next(e)
     if (!e.agentId && e.trigger !== 'precompute' && !('skip' in r && r.skip)) {
-      compacted = true
-      toldWrapUp = false
-      toldHandoff = false
+      w.compacted = true
+      w.toldWrapUp = false
+      w.toldHandoff = false
     }
     return r
   })
