@@ -80,3 +80,19 @@ export const brief = (u: Pick<SessionUsage, 'rateLimits' | 'context' | 'cost'>) 
   if (u.cost) parts.push(`$${u.cost.usd.toFixed(2)}`)
   return parts.join(' · ')
 }
+
+export const HANDOFF_TOOL = 'mcp__usage-pacer__handoff'
+
+/** What tells Claude to hand off, once the context window reaches the configured level. */
+export const handoffNotice = (percent: number) =>
+  `[usage-pacer] Context window is ${percent}% full. Hand off now: finish only the step in progress ` +
+  `(save or commit it if the project uses git), then call ${HANDOFF_TOOL} with a complete handoff: ` +
+  'the goal, what is done, what remains in order, key files and commands, decisions made and why, ' +
+  'and anything that went wrong. A fresh agent in this same environment continues from it with an empty context; ' +
+  'it sees only what you write there.'
+
+/** The prompt the fresh agent starts from. */
+export const handoffPrompt = (path: string, summary: string) =>
+  `You are continuing work handed off by a previous agent whose context window filled up. ` +
+  `Its handoff (also saved at ${path}):\n\n${summary}\n\n` +
+  'Check the current state of the files before acting on it, then carry on with what remains.'

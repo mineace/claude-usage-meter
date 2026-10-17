@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 import type { On, PromptSubmitInput } from 'claude-code'
 
 const USAGE = {
@@ -52,4 +52,52 @@ test('a tool result carries the wind-down notice once per level', async ($, on) 
   percent = 98
   const third = await $.tool.call({ tool: 'Read', file_path: 'a.md' } as never)
   expect(JSON.stringify(third)).toContain('5-hour limit at 98%')
+})
+
+const atContext = (on: On, percent: number) => {
+  on('session.usage', () => ({
+    value: { ...USAGE, rateLimits: [], context: { tokens: percent * 2000, window: 200_000, percent, isAutoCompactEnabled: true } },
+  }) as never)
+}
+
+test('a tool result asks for a handoff once the context reaches the level', async ($, on) => {
+  atContext(on, 80)
+  on('tool.call', () => ({ result: 'ok' }) as never)
+  const first = await $.tool.call({ tool: 'Read', file_path: 'a.md' } as never)
+  expect(JSON.stringify(first)).toContain('mcp__usage-pacer__handoff')
+  const second = await $.tool.call({ tool: 'Read', file_path: 'a.md' } as never)
+  expect(JSON.stringify(second)).not.toContain('Hand off now')
+})
+
+test('no handoff request below the level, or when turned off', { options: { handoffAt: 0 } }, async ($, on) => {
+  atContext(on, 99)
+  on('tool.call', () => ({ result: 'ok' }) as never)
+  const r = await $.tool.call({ tool: 'Read', file_path: 'a.md' } as never)
+  expect(JSON.stringify(r)).not.toContain('Hand off now')
+})
+
+test('the handoff tool saves the note, clears, and starts the fresh agent', async ($, on) => {
+  atContext(on, 80)
+  const writes: string[] = []
+  const steps: string[] = []
+  const clock = mock.clock(on, { now: Date.parse('2030-01-01T00:00:00Z') })
+  on('ui.toast', () => ({ value: undefined }) as never)
+  on('fs.write', (_$, e) => {
+    writes.push(String((e as { path: string }).path))
+    return { value: undefined } as never
+  })
+  on('command.run', (_$, e) => {
+    steps.push(`/${(e as { command: string }).command}`)
+    return { text: '' } as never
+  })
+  on('prompt.submit', (_$, e) => {
+    steps.push(e.text)
+    return { text: e.text } as never
+  })
+  const r = await $.tool.call({ tool: 'mcp__usage-pacer__handoff', summary: 'Goal: ship v2. Remaining: tests.' } as never)
+  expect(JSON.stringify(r)).toContain('Handoff saved to')
+  expect(writes.join()).toContain('.claude/handoffs/handoff-2030-01-01T00-00-00-000Z.md')
+  await clock.advance(10)
+  expect(steps[0]).toBe('/clear')
+  expect(steps[1]).toContain('Goal: ship v2. Remaining: tests.')
 })

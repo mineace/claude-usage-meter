@@ -1,1 +1,13 @@
-{ "name": "usage-pacer", "version": "0.1.0", "description": "Lets Claude read your plan usage (5h / 7-day limits), context fill and session cost so it can pace its work." }
+{
+  "name": "usage-pacer",
+  "version": "0.2.0",
+  "description": "Lets Claude read your plan usage (5h / 7-day limits), context fill and session cost, wind down before a limit, and hand off to a fresh agent before the context fills.",
+  "userConfig": {
+    "handoffAt": {
+      "type": "number",
+      "title": "Hand off at context %",
+      "description": "When the context window reaches this percentage, Claude writes a handoff and a fresh agent continues in the same session. 0 turns it off.",
+      "default": 75
+    }
+  }
+}
